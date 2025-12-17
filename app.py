@@ -541,14 +541,88 @@ def analyze_initial_variance():
 def analyze_repair_effect():
     """分析修盘后不同批次的质量变化"""
     try:
+        grid_id = request.args.get('gridId', type=int)
         device_id = request.args.get('deviceId')
         grid_mod = request.args.get('repairMethod')
-        max_batches = request.args.get('maxBatches', 30, type=int)
+        max_batches = request.args.get('maxBatches', 10, type=int)
         
+        max_batches = max(1, min(max_batches, 200))
+
+        # 优先：按单次修盘记录分析（选中某条修盘记录后，分析其后第 N 盘，直到下一次修盘为止）
+        if grid_id is not None:
+            query = """
+                WITH g AS (
+                    SELECT
+                        id,
+                        device_id,
+                        grid_mod,
+                        COALESCE(end_time, start_time) as grid_time
+                    FROM grid
+                    WHERE id = %s
+                ),
+                next_g AS (
+                    SELECT COALESCE(end_time, start_time) as next_grid_time
+                    FROM grid
+                    WHERE device_id = (SELECT device_id FROM g)
+                      AND COALESCE(end_time, start_time) IS NOT NULL
+                      AND COALESCE(end_time, start_time) > (SELECT grid_time FROM g)
+                    ORDER BY COALESCE(end_time, start_time), id
+                    LIMIT 1
+                ),
+                batches_with_stdev AS (
+                    SELECT
+                        o.batch_id,
+                        o.start_time,
+                        lrf.stdev
+                    FROM olam o
+                    JOIN (
+                        SELECT
+                            batch_id,
+                            STDDEV(fre) as stdev
+                        FROM last_round_f
+                        GROUP BY batch_id
+                    ) lrf ON lrf.batch_id = o.batch_id
+                    WHERE o.device_id = (SELECT device_id FROM g)
+                      AND o.start_time > (SELECT grid_time FROM g)
+                      AND (
+                           (SELECT next_grid_time FROM next_g) IS NULL
+                           OR o.start_time <= (SELECT next_grid_time FROM next_g)
+                      )
+                ),
+                ranked AS (
+                    SELECT
+                        batch_id,
+                        start_time,
+                        stdev,
+                        ROW_NUMBER() OVER (ORDER BY start_time, batch_id) as batch_number
+                    FROM batches_with_stdev
+                )
+                SELECT
+                    batch_number,
+                    AVG(stdev) as avg_stdev,
+                    NULL::double precision as std_stdev,
+                    COUNT(*) as batch_count
+                FROM ranked
+                WHERE batch_number <= %s
+                GROUP BY batch_number
+                ORDER BY batch_number
+            """
+
+            result = execute_query(query, (grid_id, max_batches))
+            meta = execute_single_query("""
+                SELECT
+                    id as grid_id,
+                    device_id,
+                    grid_mod,
+                    COALESCE(end_time, start_time) as grid_time
+                FROM grid
+                WHERE id = %s
+            """, (grid_id,))
+            return jsonify({"meta": meta, "batch_analysis": result})
+
+        # 兼容：按设备 + 修盘方式聚合分析（跨多次修盘取平均）
         if not device_id or not grid_mod:
             return jsonify({"error": "缺少设备ID或修盘方式参数"}), 400
-
-        max_batches = max(1, min(max_batches, 200))
         
         # 查询修盘后的批次质量数据（按修盘后的“研磨盘数/批次数”分析）
         # 逻辑：以每次修盘时间为起点，找该设备后续的批次；截至下一次修盘（任意方式）为止，
