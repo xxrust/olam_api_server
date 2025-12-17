@@ -6,6 +6,7 @@ import os
 import logging
 import flask
 import json
+from datetime import datetime, timedelta, timezone
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -85,6 +86,18 @@ def execute_single_query(query: str, params: tuple = None):
     except Exception as e:
         logger.error(f"查询执行失败: {str(e)}")
         raise
+
+def _clamp_interval(start_dt: datetime, end_dt: datetime, window_start: datetime, window_end: datetime):
+    start_dt = max(start_dt, window_start)
+    end_dt = min(end_dt, window_end)
+    if end_dt <= start_dt:
+        return None
+    return start_dt, end_dt
+
+def _to_iso(dt: datetime):
+    if dt is None:
+        return None
+    return dt.isoformat()
 
 def get_all_tables():
     """获取数据库中的所有表"""
@@ -452,6 +465,200 @@ def get_grid_options():
         })
     except Exception as e:
         logger.error(f"获取grid options失败: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/timeline/day', methods=['GET'])
+def get_device_timeline_day():
+    """设备日程（按天）：每台设备在一天内的修盘/研磨/空闲时间轴。"""
+    try:
+        date_str = request.args.get('date')
+        device_ids = request.args.getlist('deviceIds')
+
+        if not date_str:
+            return jsonify({"error": "缺少 date 参数（YYYY-MM-DD）"}), 400
+
+        # Use +08:00 as default local timezone (data dump uses +08).
+        tz = timezone(timedelta(hours=8))
+        try:
+            day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=tz)
+        except ValueError:
+            return jsonify({"error": "date 格式必须为 YYYY-MM-DD"}), 400
+
+        window_start = day
+        window_end = day + timedelta(days=1)
+
+        params = []
+        device_filter_sql = ""
+        if device_ids:
+            device_filter_sql = "AND device_id = ANY(%s)"
+            params.append(device_ids)
+
+        # Fetch repair events (grid)
+        grid_query = f"""
+            SELECT
+                id as grid_id,
+                device_id,
+                COALESCE(start_time, end_time) as start_time,
+                COALESCE(end_time, start_time) as end_time,
+                grid_mod
+            FROM grid
+            WHERE COALESCE(start_time, end_time) IS NOT NULL
+              AND COALESCE(end_time, start_time) IS NOT NULL
+              AND COALESCE(start_time, end_time) < %s
+              AND COALESCE(end_time, start_time) > %s
+              {device_filter_sql}
+            ORDER BY device_id, COALESCE(start_time, end_time), id
+        """
+        # Fetch grinding events (olam)
+        olam_query = f"""
+            SELECT
+                batch_id,
+                device_id,
+                start_time,
+                end_time
+            FROM olam
+            WHERE start_time < %s
+              AND end_time > %s
+              {device_filter_sql}
+            ORDER BY device_id, start_time, batch_id
+        """
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                # grid
+                cur.execute(grid_query, tuple([window_end, window_start] + params))
+                grid_rows = cur.fetchall()
+                grid_cols = [d[0] for d in cur.description]
+                grid_events = [dict(zip(grid_cols, r)) for r in grid_rows]
+
+                # olam
+                cur.execute(olam_query, tuple([window_end, window_start] + params))
+                olam_rows = cur.fetchall()
+                olam_cols = [d[0] for d in cur.description]
+                olam_events = [dict(zip(olam_cols, r)) for r in olam_rows]
+
+        by_device = {}
+
+        def add_event(device_id: str, event: dict):
+            if device_id not in by_device:
+                by_device[device_id] = []
+            by_device[device_id].append(event)
+
+        for e in grid_events:
+            s = e.get('start_time')
+            t = e.get('end_time')
+            if not s or not t:
+                continue
+            clipped = _clamp_interval(s, t, window_start, window_end)
+            if not clipped:
+                continue
+            s2, t2 = clipped
+            add_event(str(e['device_id']), {
+                "type": "repair",
+                "start": _to_iso(s2),
+                "end": _to_iso(t2),
+                "source": {"grid_id": e.get("grid_id"), "grid_mod": e.get("grid_mod")}
+            })
+
+        for e in olam_events:
+            s = e.get('start_time')
+            t = e.get('end_time')
+            if not s or not t:
+                continue
+            clipped = _clamp_interval(s, t, window_start, window_end)
+            if not clipped:
+                continue
+            s2, t2 = clipped
+            add_event(str(e['device_id']), {
+                "type": "grind",
+                "start": _to_iso(s2),
+                "end": _to_iso(t2),
+                "source": {"batch_id": e.get("batch_id")}
+            })
+
+        # Build per-device timeline with idle gaps
+        devices = []
+        total_seconds = {"repair": 0, "grind": 0, "idle": 0}
+
+        # Ensure devices appear even if there are no events when device_ids passed.
+        all_device_ids = set(by_device.keys())
+        if device_ids:
+            all_device_ids.update([str(d) for d in device_ids])
+
+        for dev in sorted(all_device_ids, key=lambda x: int(x) if str(x).isdigit() else str(x)):
+            events = by_device.get(dev, [])
+            parsed = []
+            for ev in events:
+                start = datetime.fromisoformat(ev["start"])
+                end = datetime.fromisoformat(ev["end"])
+                parsed.append((start, end, ev))
+
+            parsed.sort(key=lambda x: (x[0], x[1]))
+
+            normalized = []
+            cursor = window_start
+            last_end = window_start
+            for start, end, ev in parsed:
+                # Drop/clip overlaps
+                if start < last_end:
+                    start = last_end
+                if end <= start:
+                    continue
+                normalized.append((start, end, ev))
+                last_end = end
+
+            timeline = []
+            cursor = window_start
+            totals = {"repair": 0, "grind": 0, "idle": 0}
+
+            for start, end, ev in normalized:
+                if start > cursor:
+                    idle_start, idle_end = cursor, start
+                    dur = int((idle_end - idle_start).total_seconds())
+                    totals["idle"] += dur
+                    timeline.append({
+                        "type": "idle",
+                        "start": _to_iso(idle_start),
+                        "end": _to_iso(idle_end),
+                        "source": {}
+                    })
+                dur = int((end - start).total_seconds())
+                totals[ev["type"]] += dur
+                timeline.append({
+                    **ev,
+                    "start": _to_iso(start),
+                    "end": _to_iso(end),
+                })
+                cursor = end
+
+            if cursor < window_end:
+                dur = int((window_end - cursor).total_seconds())
+                totals["idle"] += dur
+                timeline.append({
+                    "type": "idle",
+                    "start": _to_iso(cursor),
+                    "end": _to_iso(window_end),
+                    "source": {}
+                })
+
+            for k in total_seconds:
+                total_seconds[k] += totals[k]
+
+            devices.append({
+                "device_id": dev,
+                "totals_seconds": totals,
+                "events": timeline
+            })
+
+        return jsonify({
+            "date": date_str,
+            "window_start": _to_iso(window_start),
+            "window_end": _to_iso(window_end),
+            "totals_seconds": total_seconds,
+            "devices": devices
+        })
+    except Exception as e:
+        logger.error(f"获取设备日程失败: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/batches/sample', methods=['GET'])
