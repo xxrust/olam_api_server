@@ -543,22 +543,39 @@ def analyze_repair_effect():
     try:
         device_id = request.args.get('deviceId')
         grid_mod = request.args.get('repairMethod')
+        max_batches = request.args.get('maxBatches', 30, type=int)
         
         if not device_id or not grid_mod:
             return jsonify({"error": "缺少设备ID或修盘方式参数"}), 400
+
+        max_batches = max(1, min(max_batches, 200))
         
-        # 查询修盘后的批次质量数据
+        # 查询修盘后的批次质量数据（按修盘后的“研磨盘数/批次数”分析）
+        # 逻辑：以每次修盘时间为起点，找该设备后续的批次；截至下一次修盘（任意方式）为止，
+        # 对每次修盘后的第 N 盘（N=1,2,3...）聚合 stdev。
         query = """
-            WITH grid_batches AS (
+            WITH grids AS (
                 SELECT 
-                    g.id as grid_id,
-                    g.end_time as grid_time,
-                    o.batch_id,
-                    o.start_time,
-                    lrf.stdev,
-                    ROW_NUMBER() OVER (PARTITION BY g.id ORDER BY o.start_time) as batch_number
+                    g.id,
+                    g.device_id,
+                    g.grid_mod,
+                    COALESCE(g.end_time, g.start_time) as grid_time,
+                    LEAD(COALESCE(g.end_time, g.start_time)) OVER (
+                        PARTITION BY g.device_id
+                        ORDER BY COALESCE(g.end_time, g.start_time), g.id
+                    ) as next_grid_time
                 FROM grid g
-                JOIN olam o ON o.device_id = g.device_id
+                WHERE g.device_id = %s
+                AND g.grid_mod = %s
+                AND COALESCE(g.end_time, g.start_time) IS NOT NULL
+            ),
+            batches_with_stdev AS (
+                SELECT 
+                    o.batch_id,
+                    o.device_id,
+                    o.start_time,
+                    lrf.stdev
+                FROM olam o
                 JOIN (
                     SELECT 
                         batch_id, 
@@ -566,10 +583,26 @@ def analyze_repair_effect():
                     FROM last_round_f
                     GROUP BY batch_id
                 ) lrf ON lrf.batch_id = o.batch_id
-                WHERE g.device_id = %s 
-                AND g.grid_mod = %s
-                AND o.start_time > g.end_time
-                AND o.start_time < g.end_time + INTERVAL '24 hours'
+                WHERE o.device_id = %s
+            ),
+            grid_batches AS (
+                SELECT 
+                    g.id as grid_id,
+                    g.grid_time,
+                    b.batch_id,
+                    b.start_time,
+                    b.stdev,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY g.id 
+                        ORDER BY b.start_time, b.batch_id
+                    ) as batch_number
+                FROM grids g
+                JOIN batches_with_stdev b
+                  ON b.start_time > g.grid_time
+                 AND (
+                      g.next_grid_time IS NULL
+                      OR b.start_time <= g.next_grid_time
+                 )
             )
             SELECT 
                 batch_number,
@@ -577,11 +610,12 @@ def analyze_repair_effect():
                 STDDEV(stdev) as std_stdev,
                 COUNT(*) as batch_count
             FROM grid_batches
+            WHERE batch_number <= %s
             GROUP BY batch_number
             ORDER BY batch_number
         """
         
-        result = execute_query(query, (device_id, grid_mod))
+        result = execute_query(query, (device_id, grid_mod, device_id, max_batches))
         return jsonify({"batch_analysis": result})
         
     except Exception as e:
