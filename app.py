@@ -550,6 +550,7 @@ def analyze_repair_effect():
         device_id = request.args.get('deviceId')
         grid_mod = request.args.get('repairMethod')
         max_batches = request.args.get('maxBatches', 10, type=int)
+        group_by = request.args.get('groupBy', 'all')  # all | device | grid
         
         max_batches = max(1, min(max_batches, 200))
 
@@ -563,7 +564,12 @@ def analyze_repair_effect():
             if not grid_ids:
                 return jsonify({"error": "gridIds 不能为空"}), 400
 
-            query = """
+            if group_by not in ('all', 'device', 'grid'):
+                return jsonify({"error": "groupBy 必须为 all/device/grid"}), 400
+
+            # Common CTEs for selected grid windows and candidate batches.
+            # grid_time uses repair end_time when available.
+            base_cte = """
                 WITH selected AS (
                     SELECT
                         g.id as grid_id,
@@ -591,6 +597,7 @@ def analyze_repair_effect():
                 candidate_batches AS (
                     SELECT
                         s.grid_id,
+                        s.device_id,
                         o.batch_id,
                         o.start_time,
                         ROW_NUMBER() OVER (
@@ -619,21 +626,49 @@ def analyze_repair_effect():
                 joined AS (
                     SELECT
                         l.grid_id,
+                        l.device_id,
                         l.batch_number,
                         s.stdev
                     FROM limited l
                     LEFT JOIN stdev_by_batch s ON s.batch_id = l.batch_id
-                )
-                SELECT
-                    batch_number,
-                    AVG(stdev)::double precision as avg_stdev,
-                    STDDEV(stdev)::double precision as std_stdev,
-                    COUNT(stdev)::int as batch_count,
-                    COUNT(DISTINCT grid_id)::int as grid_count
-                FROM joined
-                GROUP BY batch_number
-                ORDER BY batch_number
             """
+
+            if group_by == 'grid':
+                query = base_cte + """
+                    )
+                    SELECT
+                        grid_id,
+                        device_id,
+                        batch_number,
+                        stdev::double precision as stdev
+                    FROM joined
+                    ORDER BY grid_id, batch_number
+                """
+            elif group_by == 'device':
+                query = base_cte + """
+                    )
+                    SELECT
+                        device_id,
+                        batch_number,
+                        AVG(stdev)::double precision as avg_stdev,
+                        COUNT(stdev)::int as batch_count,
+                        COUNT(DISTINCT grid_id)::int as grid_count
+                    FROM joined
+                    GROUP BY device_id, batch_number
+                    ORDER BY device_id, batch_number
+                """
+            else:
+                query = base_cte + """
+                    )
+                    SELECT
+                        batch_number,
+                        AVG(stdev)::double precision as avg_stdev,
+                        COUNT(stdev)::int as batch_count,
+                        COUNT(DISTINCT grid_id)::int as grid_count
+                    FROM joined
+                    GROUP BY batch_number
+                    ORDER BY batch_number
+                """
 
             result = execute_query(query, (grid_ids, max_batches))
             debug = execute_single_query("""
@@ -678,6 +713,7 @@ def analyze_repair_effect():
             return jsonify({
                 "meta": {"grid_ids": grid_ids, "max_batches": max_batches},
                 "debug": debug,
+                "groupBy": group_by,
                 "batch_analysis": result
             })
 
