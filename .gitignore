@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Virtualenv
+.venv/
+venv/
+ENV/
+
+# Local env/config
+.env
+
+# Build artifacts
+build/
+dist/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
