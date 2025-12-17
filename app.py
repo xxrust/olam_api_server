@@ -599,9 +599,9 @@ def analyze_repair_effect():
                 )
                 SELECT
                     batch_number,
-                    AVG(stdev) as avg_stdev,
+                    AVG(stdev)::double precision as avg_stdev,
                     NULL::double precision as std_stdev,
-                    COUNT(*) as batch_count
+                    COUNT(*)::int as batch_count
                 FROM ranked
                 WHERE batch_number <= %s
                 GROUP BY batch_number
@@ -680,9 +680,9 @@ def analyze_repair_effect():
             )
             SELECT 
                 batch_number,
-                AVG(stdev) as avg_stdev,
-                STDDEV(stdev) as std_stdev,
-                COUNT(*) as batch_count
+                AVG(stdev)::double precision as avg_stdev,
+                STDDEV(stdev)::double precision as std_stdev,
+                COUNT(*)::int as batch_count
             FROM grid_batches
             WHERE batch_number <= %s
             GROUP BY batch_number
