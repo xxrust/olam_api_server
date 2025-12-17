@@ -612,14 +612,58 @@ def analyze_repair_effect():
             result = execute_query(query, (grid_id, max_batches))
             meta = execute_single_query("""
                 SELECT
-                    id as grid_id,
-                    device_id,
-                    grid_mod,
-                    COALESCE(end_time, start_time) as grid_time
-                FROM grid
-                WHERE id = %s
+                    g.id as grid_id,
+                    g.device_id,
+                    g.grid_mod,
+                    COALESCE(g.end_time, g.start_time) as grid_time,
+                    (
+                        SELECT COALESCE(g2.start_time, g2.end_time)
+                        FROM grid g2
+                        WHERE g2.device_id = g.device_id
+                          AND COALESCE(g2.start_time, g2.end_time) IS NOT NULL
+                          AND COALESCE(g2.start_time, g2.end_time) > COALESCE(g.end_time, g.start_time)
+                        ORDER BY COALESCE(g2.start_time, g2.end_time), g2.id
+                        LIMIT 1
+                    ) as next_grid_time
+                FROM grid g
+                WHERE g.id = %s
             """, (grid_id,))
-            return jsonify({"meta": meta, "batch_analysis": result})
+
+            debug = execute_single_query("""
+                WITH g AS (
+                    SELECT
+                        id,
+                        device_id,
+                        COALESCE(end_time, start_time) as grid_time
+                    FROM grid
+                    WHERE id = %s
+                ),
+                next_g AS (
+                    SELECT COALESCE(start_time, end_time) as next_grid_time
+                    FROM grid
+                    WHERE device_id = (SELECT device_id FROM g)
+                      AND COALESCE(start_time, end_time) IS NOT NULL
+                      AND COALESCE(start_time, end_time) > (SELECT grid_time FROM g)
+                    ORDER BY COALESCE(start_time, end_time), id
+                    LIMIT 1
+                ),
+                candidates AS (
+                    SELECT o.batch_id
+                    FROM olam o
+                    WHERE o.device_id = (SELECT device_id FROM g)
+                      AND o.start_time >= (SELECT grid_time FROM g)
+                      AND (
+                           (SELECT next_grid_time FROM next_g) IS NULL
+                           OR o.start_time < (SELECT next_grid_time FROM next_g)
+                      )
+                    ORDER BY o.start_time, o.batch_id
+                    LIMIT %s
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM candidates)::int as candidate_batches
+            """, (grid_id, max_batches))
+
+            return jsonify({"meta": meta, "debug": debug, "batch_analysis": result})
 
         # 兼容：按设备 + 修盘方式聚合分析（跨多次修盘取平均）
         if not device_id or not grid_mod:
