@@ -546,11 +546,140 @@ def analyze_repair_effect():
     """分析修盘后不同批次的质量变化"""
     try:
         grid_id = request.args.get('gridId', type=int)
+        grid_ids_raw = request.args.getlist('gridIds')
         device_id = request.args.get('deviceId')
         grid_mod = request.args.get('repairMethod')
         max_batches = request.args.get('maxBatches', 10, type=int)
         
         max_batches = max(1, min(max_batches, 200))
+
+        # 多选：按多条修盘记录聚合分析（选中多条修盘记录后，对每条修盘的第 N 盘进行聚合）
+        if grid_ids_raw:
+            try:
+                grid_ids = [int(x) for x in grid_ids_raw if str(x).strip() != ""]
+            except (TypeError, ValueError):
+                return jsonify({"error": "gridIds 必须为整数列表"}), 400
+
+            if not grid_ids:
+                return jsonify({"error": "gridIds 不能为空"}), 400
+
+            query = """
+                WITH selected AS (
+                    SELECT
+                        g.id as grid_id,
+                        g.device_id,
+                        g.grid_mod,
+                        COALESCE(g.end_time, g.start_time) as grid_time
+                    FROM grid g
+                    WHERE g.id = ANY(%s::int[])
+                      AND COALESCE(g.end_time, g.start_time) IS NOT NULL
+                ),
+                selected_with_next AS (
+                    SELECT
+                        s.*,
+                        (
+                            SELECT COALESCE(g2.start_time, g2.end_time)
+                            FROM grid g2
+                            WHERE g2.device_id = s.device_id
+                              AND COALESCE(g2.start_time, g2.end_time) IS NOT NULL
+                              AND COALESCE(g2.start_time, g2.end_time) > s.grid_time
+                            ORDER BY COALESCE(g2.start_time, g2.end_time), g2.id
+                            LIMIT 1
+                        ) as next_grid_time
+                    FROM selected s
+                ),
+                candidate_batches AS (
+                    SELECT
+                        s.grid_id,
+                        o.batch_id,
+                        o.start_time,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY s.grid_id
+                            ORDER BY o.start_time, o.batch_id
+                        ) as batch_number
+                    FROM selected_with_next s
+                    JOIN olam o
+                      ON o.device_id = s.device_id
+                     AND o.start_time >= s.grid_time
+                     AND (s.next_grid_time IS NULL OR o.start_time < s.next_grid_time)
+                ),
+                limited AS (
+                    SELECT *
+                    FROM candidate_batches
+                    WHERE batch_number <= %s
+                ),
+                stdev_by_batch AS (
+                    SELECT
+                        batch_id,
+                        STDDEV(fre)::double precision as stdev
+                    FROM last_round_f
+                    WHERE batch_id IN (SELECT batch_id FROM limited)
+                    GROUP BY batch_id
+                ),
+                joined AS (
+                    SELECT
+                        l.grid_id,
+                        l.batch_number,
+                        s.stdev
+                    FROM limited l
+                    LEFT JOIN stdev_by_batch s ON s.batch_id = l.batch_id
+                )
+                SELECT
+                    batch_number,
+                    AVG(stdev)::double precision as avg_stdev,
+                    STDDEV(stdev)::double precision as std_stdev,
+                    COUNT(stdev)::int as batch_count,
+                    COUNT(DISTINCT grid_id)::int as grid_count
+                FROM joined
+                GROUP BY batch_number
+                ORDER BY batch_number
+            """
+
+            result = execute_query(query, (grid_ids, max_batches))
+            debug = execute_single_query("""
+                WITH selected AS (
+                    SELECT
+                        g.id as grid_id,
+                        g.device_id,
+                        COALESCE(g.end_time, g.start_time) as grid_time
+                    FROM grid g
+                    WHERE g.id = ANY(%s::int[])
+                      AND COALESCE(g.end_time, g.start_time) IS NOT NULL
+                ),
+                selected_with_next AS (
+                    SELECT
+                        s.*,
+                        (
+                            SELECT COALESCE(g2.start_time, g2.end_time)
+                            FROM grid g2
+                            WHERE g2.device_id = s.device_id
+                              AND COALESCE(g2.start_time, g2.end_time) IS NOT NULL
+                              AND COALESCE(g2.start_time, g2.end_time) > s.grid_time
+                            ORDER BY COALESCE(g2.start_time, g2.end_time), g2.id
+                            LIMIT 1
+                        ) as next_grid_time
+                    FROM selected s
+                ),
+                candidates AS (
+                    SELECT
+                        s.grid_id,
+                        o.batch_id
+                    FROM selected_with_next s
+                    JOIN olam o
+                      ON o.device_id = s.device_id
+                     AND o.start_time >= s.grid_time
+                     AND (s.next_grid_time IS NULL OR o.start_time < s.next_grid_time)
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM selected)::int as selected_grids,
+                    (SELECT COUNT(DISTINCT grid_id) FROM candidates)::int as grids_with_candidates
+            """, (grid_ids,))
+
+            return jsonify({
+                "meta": {"grid_ids": grid_ids, "max_batches": max_batches},
+                "debug": debug,
+                "batch_analysis": result
+            })
 
         # 优先：按单次修盘记录分析（选中某条修盘记录后，分析其后第 N 盘，直到下一次修盘为止）
         if grid_id is not None:
