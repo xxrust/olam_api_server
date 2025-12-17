@@ -592,7 +592,7 @@ def analyze_repair_effect():
                         cb.batch_id,
                         cb.start_time,
                         s.stdev,
-                        ROW_NUMBER() OVER (ORDER BY start_time, batch_id) as batch_number
+                        ROW_NUMBER() OVER (ORDER BY cb.start_time, cb.batch_id) as batch_number
                     FROM candidate_batches cb
                     LEFT JOIN (
                         SELECT
