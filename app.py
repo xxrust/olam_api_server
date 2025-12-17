@@ -561,41 +561,43 @@ def analyze_repair_effect():
                     WHERE id = %s
                 ),
                 next_g AS (
-                    SELECT COALESCE(end_time, start_time) as next_grid_time
+                    SELECT COALESCE(start_time, end_time) as next_grid_time
                     FROM grid
                     WHERE device_id = (SELECT device_id FROM g)
-                      AND COALESCE(end_time, start_time) IS NOT NULL
-                      AND COALESCE(end_time, start_time) > (SELECT grid_time FROM g)
-                    ORDER BY COALESCE(end_time, start_time), id
+                      AND COALESCE(start_time, end_time) IS NOT NULL
+                      AND COALESCE(start_time, end_time) > (SELECT grid_time FROM g)
+                    ORDER BY COALESCE(start_time, end_time), id
                     LIMIT 1
                 ),
-                batches_with_stdev AS (
+                candidate_batches AS (
                     SELECT
                         o.batch_id,
-                        o.start_time,
-                        lrf.stdev
+                        o.start_time
                     FROM olam o
-                    JOIN (
-                        SELECT
-                            batch_id,
-                            STDDEV(fre) as stdev
-                        FROM last_round_f
-                        GROUP BY batch_id
-                    ) lrf ON lrf.batch_id = o.batch_id
                     WHERE o.device_id = (SELECT device_id FROM g)
-                      AND o.start_time > (SELECT grid_time FROM g)
+                      AND o.start_time >= (SELECT grid_time FROM g)
                       AND (
                            (SELECT next_grid_time FROM next_g) IS NULL
-                           OR o.start_time <= (SELECT next_grid_time FROM next_g)
+                           OR o.start_time < (SELECT next_grid_time FROM next_g)
                       )
+                    ORDER BY o.start_time, o.batch_id
+                    LIMIT %s
                 ),
                 ranked AS (
                     SELECT
-                        batch_id,
-                        start_time,
-                        stdev,
+                        cb.batch_id,
+                        cb.start_time,
+                        s.stdev,
                         ROW_NUMBER() OVER (ORDER BY start_time, batch_id) as batch_number
-                    FROM batches_with_stdev
+                    FROM candidate_batches cb
+                    LEFT JOIN (
+                        SELECT
+                            batch_id,
+                            STDDEV(fre)::double precision as stdev
+                        FROM last_round_f
+                        WHERE batch_id IN (SELECT batch_id FROM candidate_batches)
+                        GROUP BY batch_id
+                    ) s ON s.batch_id = cb.batch_id
                 )
                 SELECT
                     batch_number,
@@ -603,7 +605,6 @@ def analyze_repair_effect():
                     NULL::double precision as std_stdev,
                     COUNT(*)::int as batch_count
                 FROM ranked
-                WHERE batch_number <= %s
                 GROUP BY batch_number
                 ORDER BY batch_number
             """
@@ -634,9 +635,9 @@ def analyze_repair_effect():
                     g.device_id,
                     g.grid_mod,
                     COALESCE(g.end_time, g.start_time) as grid_time,
-                    LEAD(COALESCE(g.end_time, g.start_time)) OVER (
+                    LEAD(COALESCE(g.start_time, g.end_time)) OVER (
                         PARTITION BY g.device_id
-                        ORDER BY COALESCE(g.end_time, g.start_time), g.id
+                        ORDER BY COALESCE(g.start_time, g.end_time), g.id
                     ) as next_grid_time
                 FROM grid g
                 WHERE g.device_id = %s
