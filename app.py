@@ -363,6 +363,7 @@ def get_operators():
 def get_grid_records():
     """获取 grid(修盘) 表数据列表。"""
     try:
+        grid_id = request.args.get('gridId', type=int)
         device_id = request.args.get('deviceId')
         grid_mod_raw = request.args.get('gridMod') or request.args.get('repairMethod')
         start_date = request.args.get('startDate')
@@ -383,6 +384,9 @@ def get_grid_records():
         conditions = []
         params = []
 
+        if grid_id is not None:
+            conditions.append("g.id = %s")
+            params.append(grid_id)
         if device_id:
             conditions.append("g.device_id = %s")
             params.append(device_id)
