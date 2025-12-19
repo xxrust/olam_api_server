@@ -6,6 +6,8 @@ import os
 import logging
 import flask
 import json
+import re
+import requests
 from datetime import datetime, timedelta, timezone
 
 # 配置日志
@@ -1597,6 +1599,249 @@ def export_last_round_f_data():
     except Exception as e:
         logger.error(f"导出last_round_f数据失败: {str(e)}")
         return jsonify({"error": str(e)}), 500
+
+AI_PROVIDER_BASE_URLS = {
+    "openai": "https://api.openai.com/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+}
+
+_FORBIDDEN_SQL = re.compile(
+    r"\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|copy|call|execute|vacuum|analyze)\b",
+    re.IGNORECASE,
+)
+_BLOCKED_CHARS = re.compile(r";")
+_BLOCKED_PG_META = re.compile(r"\\copy|\\g|\\dt|\\d", re.IGNORECASE)
+
+
+def _resolve_ai_base_url(provider_id: str, base_url: str | None):
+    if provider_id == "custom":
+        return (base_url or "").strip()
+    if provider_id in AI_PROVIDER_BASE_URLS:
+        return AI_PROVIDER_BASE_URLS[provider_id]
+    return (base_url or "").strip()
+
+
+def _build_chat_completions_url(base_url: str):
+    base_url = (base_url or "").strip()
+    if not base_url:
+        return ""
+    if base_url.endswith("/chat/completions"):
+        return base_url
+    return base_url.rstrip("/") + "/chat/completions"
+
+
+def _strip_sql_comments(sql: str):
+    sql = re.sub(r"/\\*.*?\\*/", " ", sql, flags=re.DOTALL)
+    sql = re.sub(r"--.*?$", " ", sql, flags=re.MULTILINE)
+    return sql
+
+
+def _sanitize_readonly_sql(sql: str, max_rows: int):
+    if not isinstance(sql, str):
+        raise ValueError("sql必须是字符串")
+
+    sql = sql.strip()
+    sql = re.sub(r"^```(?:sql)?\s*", "", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\s*```$", "", sql).strip()
+
+    sql_no_comments = _strip_sql_comments(sql).strip()
+    if not sql_no_comments:
+        raise ValueError("SQL为空")
+
+    # 允许结尾的单个分号（模型常输出）；仍禁止多语句/中间分号。
+    sql_no_comments = sql_no_comments.rstrip()
+    if sql_no_comments.endswith(";"):
+        sql_no_comments = sql_no_comments[:-1].rstrip()
+
+    if _BLOCKED_CHARS.search(sql_no_comments) or _BLOCKED_PG_META.search(sql_no_comments):
+        raise ValueError("仅允许单条只读SQL（不允许分号/元命令）")
+
+    if _FORBIDDEN_SQL.search(sql_no_comments):
+        raise ValueError("仅允许只读查询（SELECT/WITH）")
+
+    head = sql_no_comments.lstrip().lower()
+    if not (head.startswith("select") or head.startswith("with")):
+        raise ValueError("仅允许SELECT或WITH开头的查询")
+
+    has_limit = re.search(r"\blimit\s+\d+\b", sql_no_comments, flags=re.IGNORECASE) is not None
+    if has_limit:
+        return sql_no_comments
+
+    max_rows = int(max_rows)
+    max_rows = max(10, min(max_rows, 1000))
+    return f"SELECT * FROM ({sql_no_comments}) AS t LIMIT {max_rows}"
+
+
+def _schema_snapshot_text(max_tables: int = 40, max_cols: int = 25):
+    all_tables = get_all_tables()
+    if not all_tables:
+        return "（未获取到任何表，可能数据库未连接）"
+
+    tables = all_tables[:max_tables]
+    parts: list[str] = []
+    for t in tables:
+        cols = get_table_columns(t)[:max_cols]
+        cols_text = ", ".join([f"{c}:{dt}" for c, dt in cols])
+        parts.append(f"- {t}({cols_text})")
+
+    more = "" if len(all_tables) <= max_tables else f"\\n（仅展示前{max_tables}张表）"
+    return "\\n".join(parts) + more
+
+
+def _try_parse_json_object(text: str):
+    if not isinstance(text, str):
+        return None
+
+    text = text.strip()
+    if not text:
+        return None
+
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    m = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    if m:
+        try:
+            obj = json.loads(m.group(1))
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            obj = json.loads(text[start : end + 1])
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+    return None
+
+
+def _openai_compat_chat(base_url: str, api_key: str, model: str, messages: list[dict], timeout_s: int = 60):
+    url = _build_chat_completions_url(base_url)
+    if not url:
+        raise ValueError("缺少AI Base URL")
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    payload = {"model": model, "messages": messages, "temperature": 0.2}
+    resp = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"模型调用失败({resp.status_code}): {resp.text[:500]}")
+
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+
+
+@app.route("/api/ai/chat", methods=["POST"])
+def ai_chat():
+    payload = request.get_json(silent=True) or {}
+
+    provider_id = str(payload.get("providerId") or "custom")
+    base_url = _resolve_ai_base_url(provider_id, payload.get("baseUrl"))
+    model = str(payload.get("model") or "").strip()
+    api_key = str(payload.get("apiKey") or "").strip()
+    user_message = str(payload.get("message") or "").strip()
+    history = payload.get("history") or []
+
+    try:
+        max_rows = int(payload.get("maxRows") or 200)
+    except Exception:
+        max_rows = 200
+    max_rows = max(10, min(max_rows, 1000))
+
+    if not model:
+        return jsonify({"error": "缺少model"}), 400
+    if not api_key:
+        return jsonify({"error": "缺少apiKey"}), 400
+    if not user_message:
+        return jsonify({"error": "缺少message"}), 400
+
+    schema_text = _schema_snapshot_text()
+
+    system_prompt = (
+        "你是OLAM数据分析系统的AI助手，帮助用户通过PostgreSQL数据库分析数据。\\n"
+        "规则：\\n"
+        "1) 如果需要查询数据，生成只读SQL（仅SELECT/WITH）。\\n"
+        "2) 不要生成任何会修改数据的SQL。\\n"
+        "3) 输出必须是JSON对象：{\\\"reply\\\": string, \\\"sql\\\": string}，sql可为空字符串。\\n"
+        f"4) 查询默认限制行数不超过{max_rows}。\\n\\n"
+        "数据库结构（public schema，简略）：\\n"
+        f"{schema_text}"
+    )
+
+    msgs: list[dict] = [{"role": "system", "content": system_prompt}]
+    if isinstance(history, list):
+        for m in history[-10:]:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            content = m.get("content")
+            if role not in ("user", "assistant"):
+                continue
+            if not isinstance(content, str):
+                continue
+            msgs.append({"role": role, "content": content})
+
+    msgs.append({"role": "user", "content": user_message})
+
+    try:
+        first = _openai_compat_chat(base_url=base_url, api_key=api_key, model=model, messages=msgs)
+        first_obj = _try_parse_json_object(first) or {"reply": first, "sql": ""}
+        reply = str(first_obj.get("reply") or "").strip() or str(first).strip()
+        sql = str(first_obj.get("sql") or "").strip()
+
+        if not sql:
+            return jsonify({"reply": reply, "sql": "", "rowCount": None})
+
+        safe_sql = _sanitize_readonly_sql(sql, max_rows=max_rows)
+        rows = execute_query(safe_sql)
+        row_count = len(rows) if rows else 0
+
+        rows_preview = (rows or [])[:50]
+        system_prompt_2 = (
+            "你是数据分析助手。基于用户问题、SQL和查询结果给出结论与下一步建议。\\n"
+            "输出必须是JSON对象：{\\\"reply\\\": string}。"
+        )
+        msgs2 = [
+            {"role": "system", "content": system_prompt_2},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "question": user_message,
+                        "sql": safe_sql,
+                        "rowCount": row_count,
+                        "rowsPreview": rows_preview,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+
+        second = _openai_compat_chat(base_url=base_url, api_key=api_key, model=model, messages=msgs2)
+        second_obj = _try_parse_json_object(second) or {"reply": second}
+        final_reply = str(second_obj.get("reply") or "").strip() or str(second).strip()
+
+        return jsonify({"reply": final_reply, "sql": safe_sql, "rowCount": row_count})
+
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.exception("AI chat failed")
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == '__main__':
     print("正在启动服务器...")
